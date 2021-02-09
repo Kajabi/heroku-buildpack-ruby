@@ -23,16 +23,8 @@ class LanguagePack::Ruby < LanguagePack::Base
   # @return [Boolean] true if it's a Ruby app
   def self.use?
     instrument "ruby.use" do
-      File.exist?("Gemfile")
+      File.exist?(bundler.gemfile)
     end
-  end
-
-  def self.bundler
-    @@bundler ||= LanguagePack::Helpers::BundlerWrapper.new.install
-  end
-
-  def bundler
-    self.class.bundler
   end
 
   def initialize(build_path, cache_path=nil)
@@ -91,6 +83,7 @@ WARNING
       # check for new app at the beginning of the compile
       new_app?
       Dir.chdir(build_path)
+      check_for_bundle_config
       remove_vendor_bundle
       warn_bundler_upgrade
       install_ruby
@@ -529,8 +522,8 @@ SHELL
       topic "Using Ruby version: #{ruby_version.version_for_download}"
       if !ruby_version.set
         warn(<<-WARNING)
-You have not declared a Ruby version in your Gemfile.
-To set your Ruby version add this line to your Gemfile:
+You have not declared a Ruby version in your #{bundler.gemfile}.
+To set your Ruby version add this line to your #{bundler.gemfile}:
 #{ruby_version.to_gemfile}
 # See https://devcenter.heroku.com/articles/ruby-versions for more information.
 WARNING
@@ -780,6 +773,23 @@ BUNDLE
     FileUtils.chmod(0755, shim_path)
   end
 
+  # This has to come before any bundle commands are executed since some env
+  # vars will create it.
+  def check_for_bundle_config
+    instrument 'ruby.check_for_bundle_config' do
+      if File.exist?("#{Dir.pwd}/.bundle/config")
+        warn(<<-WARNING, inline: true)
+You have the `.bundle/config` file checked into your repository
+It contains local state like the location of the installed bundle
+as well as configured git local gems, and other settings that should
+not be shared between multiple checkouts of a single repo. Please
+remove the `.bundle/` folder from your repo and add it to your `.gitignore` file.
+https://devcenter.heroku.com/articles/bundler-configuration
+WARNING
+      end
+    end
+  end
+
   # runs bundler to install the dependencies
   def build_bundler(default_bundle_without)
     instrument 'ruby.build_bundler' do
@@ -789,20 +799,9 @@ BUNDLE
         bundle_command = "#{bundle_bin} install --without #{bundle_without} --path vendor/bundle --binstubs #{bundler_binstubs_path}"
         bundle_command << " -j4"
 
-        if File.exist?("#{Dir.pwd}/.bundle/config")
+        if bundler.windows_lockfile?
           warn(<<-WARNING, inline: true)
-You have the `.bundle/config` file checked into your repository
- It contains local state like the location of the installed bundle
- as well as configured git local gems, and other settings that should
-not be shared between multiple checkouts of a single repo. Please
-remove the `.bundle/` folder from your repo and add it to your `.gitignore` file.
-https://devcenter.heroku.com/articles/bundler-configuration
-WARNING
-        end
-
-        if bundler.windows_gemfile_lock?
-          warn(<<-WARNING, inline: true)
-Removing `Gemfile.lock` because it was generated on Windows.
+Removing `#{bundler.lockfile}` because it was generated on Windows.
 Bundler will do a full resolve so native gems are handled properly.
 This may result in unexpected gem versions being used in your app.
 In rare occasions Bundler may not be able to resolve your dependencies at all.
@@ -810,7 +809,7 @@ https://devcenter.heroku.com/articles/bundler-windows-gemfile
 WARNING
 
           log("bundle", "has_windows_gemfile_lock")
-          File.unlink("Gemfile.lock")
+          File.unlink(bundler.lockfile)
         else
           # using --deployment is preferred if we can
           bundle_command += " --deployment"
@@ -834,7 +833,7 @@ WARNING
 
           # we need to set BUNDLE_CONFIG and BUNDLE_GEMFILE for
           # codon since it uses bundler.
-         env_vars["BUNDLE_GEMFILE"] = "#{pwd}/Gemfile"
+          env_vars["BUNDLE_GEMFILE"] = bundler.gemfile_path.realpath.to_s
           env_vars["BUNDLE_CONFIG"] = "#{pwd}/.bundle/config"
           env_vars["CPATH"] = noshellescape("#{yaml_include}:$CPATH")
           env_vars["CPPATH"] = noshellescape("#{yaml_include}:$CPPATH")
@@ -884,16 +883,16 @@ https://devcenter.heroku.com/articles/sqlite3
             ERROR
           end
 
-          if bundler_output.match(/but your Gemfile specified/)
+          if bundler_output.match(/but your #{bundler.gemfile} specified/)
             mcount "fail.ruby_version_mismatch"
             error_message += <<-ERROR
 
 Detected a mismatch between your Ruby version installed and
-Ruby version specified in Gemfile or Gemfile.lock. You can
+Ruby version specified in #{bundler.gemfile} or #{bundler.lockfile}. You can
 correct this by running:
 
     $ bundle update --ruby
-    $ git add Gemfile.lock
+    $ git add #{bundler.lockfile}
     $ git commit -m "update ruby version"
 
 If this does not solve the issue please see this documentation:
@@ -1007,7 +1006,7 @@ params = CGI.parse(uri.query || "")
       raise_on_fail      = bundler.gem_version('railties') && bundler.gem_version('railties') > Gem::Version.new('3.x')
 
       topic "Detecting rake tasks"
-      rake = LanguagePack::Helpers::RakeRunner.new(rake_gem_available)
+      rake = LanguagePack::Helpers::RakeRunner.new(rake_gem_available, bundler.gemfile)
       rake.load_rake_tasks!({ env: rake_env }, raise_on_fail)
       rake
     end
